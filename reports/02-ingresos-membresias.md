@@ -1,154 +1,141 @@
-# Report 2 — Ingresos y Membresías
+# Report 2 — Membresías y Utilización de Créditos
 
 ## Objetivo
 
-Analizar la salud financiera del negocio mediante la distribución por tipo de suscripción y el crecimiento de la base de usuarios. Produce indicadores clave de membresías y tendencias de crecimiento de suscriptores.
+Auditores y stakeholders utilizan este reporte para monitorear el **ciclo de vida de las membresías** y la **tasa de utilización de créditos** (sesiones). El objetivo es medir la retención de usuarios y asegurar que los créditos otorgados por membresías se consuman correctamente según los tipos de actividad.
 
 ---
 
-## Métricas Clave del Reporte
+## Métricas Clave
 
 | Métrica | Descripción |
 |---|---|
-| **Nuevos usuarios activos** | Usuarios registrados por primera vez en el período |
-| **Tasa de crecimiento de suscriptores** | MoM growth de `users_memberships` |
+| **Consumo de Sesiones** | Suma de `value` negativo en la tabla `transactions`. |
+| **Balance de Créditos** | Suma acumulada de `value` (grants - consumos) por usuario y actividad. |
+| **Penetración por Plan** | Distribución de usuarios activos (`users_memberships`) por tipo de membresía. |
+| **Engagement Rate** | Relación entre créditos otorgados y créditos consumidos en el periodo. |
 
 ---
 
-## Fuentes de Datos
+## Fuentes de Datos (Esquema MySQL)
 
-| Tabla MySQL | Columnas utilizadas |
-|---|---|
-| `memberships` | `id`, `name`, `color` |
-| `users_memberships` | `user`, `membership` |
-| `memberships_activityTypes` | `membership`, `activity`, `amount`, `period` |
-| `users` | `id`, `createdAt`, `banned` |
+| Tabla | Rol | Columnas Clave |
+|---|---|---|
+| `users` | Perfiles | `id`, `name`, `createdAt`, `banned` |
+| `memberships` | Catálogo | `id`, `name`, `color` |
+| `users_memberships` | Asignación | `user` (FK), `membership` (FK) |
+| `transactions` | **Auditoría** | `userID`, `membershipID`, `activityID`, `value` (+/-) |
+| `memberships_activityTypes` | Reglas | `membership`, `activity`, `amount`, `period` |
 
 ---
 
-## Pipeline ADF: `PL_Report_Revenue`
+## Pipeline ADF: `PL_Report_Membership_Utilization`
 
 ### Estructura general
 
-```
-PL_Report_Revenue
-├── ACT_Copy_Bronze
-│   ├── Copy_memberships
-│   ├── Copy_users_memberships
-│   ├── Copy_memberships_activityTypes
-│   └── Copy_users (id, createdAt)
-├── ACT_DataFlow_Silver
-│   └── DF_Silver_MembershipGrowth
-└── ACT_DataFlow_Gold
-    └── DF_Gold_NewUsers
+```mermaid
+graph TD
+    A[MySQL Source] --> B[Bronze Datasets]
+    B --> C[Silver Dataflow: DF_Silver_Balances]
+    C --> D[Gold Dataflow: DF_Gold_MembershipKpis]
+    D --> E[Azure SQL / Power BI]
 ```
 
 ---
 
-## Paso 1 — Ingesta a Bronze
+## Paso 1 — Ingesta a Bronze (SQL Extract)
 
-### Copy_memberships
+### Extract_Transactions
+Identifica el consumo real de actividades. Un `value < 0` indica uso de sesión.
 ```sql
-SELECT id, name FROM memberships;
+SELECT 
+    userID, 
+    membershipID, 
+    activityID, 
+    value, 
+    id as transactionID 
+FROM transactions;
 ```
 
-### Copy_users_memberships
+### Extract_User_Plans
+Mapea usuarios a sus membresías actuales.
 ```sql
-SELECT user, membership FROM users_memberships;
+SELECT 
+    user, 
+    membership 
+FROM users_memberships;
 ```
 
-### Copy_memberships_activityTypes
+### Extract_Users (Nuevos registros)
 ```sql
-SELECT membership, activity, amount, period FROM memberships_activityTypes;
-```
-
-### Copy_users (solo nuevos)
-```sql
-SELECT id, createdAt
+SELECT id, name, createdAt
 FROM users
-WHERE verified = 1
-  AND banned   = 0
-  AND createdAt >= '@{pipeline().parameters.p_watermark_date}'
+WHERE verified = 1 AND banned = 0;
 ```
 
 ---
 
-## Paso 2 — Silver
+## Paso 2 — Silver: Cálculo de Utilización
 
-### `DF_Silver_MembershipGrowth`
+### `DF_Silver_UsageAudit`
 
-**Source** → `Bronze_users_memberships` JOIN `Bronze_memberships`
+**Source** → `Bronze_transactions` JOIN `Bronze_memberships`
 
-1. **Join** on `users_memberships.membership = memberships.id`
+1. **Categorización de Valor**:
+   - `usage_flag` = `iif(value < 0, 1, 0)`
+   - `grant_flag` = `iif(value > 0, 1, 0)`
 
-2. **Join** con `Bronze_users` on `users_memberships.user = users.id`
-   - Columnas: `user`, `name AS membership_name`, `users.createdAt AS user_registration`
+2. **Join** con `Bronze_memberships` on `membershipID`
+   - Obtenemos `membership_name` y `color`.
 
-3. **Derived Column** — `registration_ym`
+3. **Window Function** — Saldo por Usuario/Actividad:
    ```
-   toString(year(user_registration)) + '-' + lpad(toString(month(user_registration)), 2, '0')
-   ```
-
-4. **Aggregate** — por `registration_ym`, `membership_name`
-   ```
-   new_subscribers = count(user)
+   current_balance = sum(value) over (partitionBy: [userID, activityID], orderBy: transactionID ASC)
    ```
 
-5. **Window** — acumulado por `membership_name`
-   ```
-   cumulative_subscribers = cumSum(new_subscribers) over (partitionBy: [membership_name], orderBy: registration_ym ASC)
-   ```
-
-6. **Sink** → `Silver_membership_growth`
+4. **Sink** → `Silver_user_balances`
 
 ---
 
-## Paso 3 — Gold
+## Paso 3 — Gold: KPIs de Retención
 
-### `DF_Gold_NewUsers`
+### `DF_Gold_UserLifeCycle`
 
-**Source** → `Bronze_users`
+**Source** → `Silver_user_balances` JOIN `Bronze_users`
 
-1. **Aggregate** — por `registration_ym` (derivar de `createdAt`)
-   ```
-   new_users_count = count(id)
-   ```
+1. **Aggregate** por `registration_ym` y `membershipID`:
+   - `total_active_users = countDistinct(userID)`
+   - `total_sessions_consumed = sum(usage_flag)`
+   - `avg_balance_per_user = avg(current_balance)`
 
-2. **Window** — acumulado:
-   ```
-   cumulative_users = cumSum(new_users_count) over (orderBy: registration_ym ASC)
-   ```
-
-3. **Sink** → `DS_AzureSQL_fact_user_growth`
+2. **Sink** → `DS_AzureSQL_fact_membership_kpis`
 
 ---
 
-## Esquema Gold (Output Tables)
+## Esquema Gold (Azure SQL Target)
 
-### `fact_user_growth`
+### `fact_membership_activity`
 ```sql
-CREATE TABLE fact_user_growth (
-    registration_ym       VARCHAR(7)    NOT NULL,
-    new_users_count       INT           NOT NULL DEFAULT 0,
-    cumulative_users      INT           NOT NULL DEFAULT 0,
-    etl_run_date          DATETIME      DEFAULT GETDATE(),
-    PRIMARY KEY (registration_ym)
+CREATE TABLE fact_membership_activity (
+    report_date           DATE          NOT NULL,
+    membership_name       VARCHAR(100),
+    active_subscribers    INT           DEFAULT 0,
+    sessions_consumed     INT           DEFAULT 0,
+    total_credits_granted INT           DEFAULT 0,
+    etl_run_id           VARCHAR(50),
+    PRIMARY KEY (report_date, membership_name)
 );
 ```
 
 ---
 
-## Trigger
+## Visualización Sugerida (Power BI)
 
-- **Tipo**: Schedule Trigger
-- **Frecuencia**: Mensual (1er día del mes a las 02:00 UTC) para cierre contable
+1. **Dashboard de Utilización**: Treemap de `membership_name` por `sessions_consumed`.
+2. **Saldo Crítico**: Tabla de usuarios con `current_balance < 2` (Alertas de renovación).
+3. **Tendencia de Crecimiento**: Línea de tiempo con `active_subscribers` MoM.
 
 ---
 
-## Visualización Sugerida (Power BI)
-
-| Visual | Tipo | Campos |
-|---|---|---|
-| Crecimiento de suscriptores | Line chart | `registration_ym`, `cumulative_users`, `new_users_count` |
-| Nuevos usuarios por mes | Bar chart | `registration_ym`, `new_users_count` |
-| KPIs del mes | Cards | Nuevos suscriptores, total acumulado, crecimiento MoM |
+> [!NOTE]
+> Las inconsistencias previas en los nombres de campos (`user` vs `userID`) han sido corregidas para garantizar la integridad referencial en el pipeline ETL.
