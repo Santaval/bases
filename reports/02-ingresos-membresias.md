@@ -75,25 +75,42 @@ WHERE verified = 1 AND banned = 0;
 
 ---
 
-## Paso 2 — Silver: Cálculo de Utilización
+## Paso 2 — Silver: Auditoría y Lógica de Negocio
 
-### `DF_Silver_UsageAudit`
+En esta fase, los datos crudos de **Bronze** se transforman en un libro mayor (ledger) de créditos para determinar el estado real de cada usuario.
 
-**Source** → `Bronze_transactions` JOIN `Bronze_memberships`
+### `DF_Silver_UsageAudit` (Lógica de Transformación)
 
-1. **Categorización de Valor**:
-   - `usage_flag` = `iif(value < 0, 1, 0)`
-   - `grant_flag` = `iif(value > 0, 1, 0)`
+#### 1. Categorización de Movimientos (Derived Column)
+Primero, clasificamos cada transacción para facilitar el cálculo de KPIs:
+- `IsConsumption`: `iif(value < 0, 1, 0)` -> Marca cuando un usuario usa una sesión.
+- `IsGrant`: `iif(value > 0, 1, 0)` -> Marca cuando se le otorgan créditos a un usuario.
+- `AbsoluteValue`: `abs(value)`
 
-2. **Join** con `Bronze_memberships` on `membershipID`
-   - Obtenemos `membership_name` y `color`.
+#### 2. Enriquecimiento de Datos (Joins)
+Realizamos una serie de Joins para contextualizar la utilización:
+- **Inner Join** con `Bronze_memberships` sobre `membershipID`:
+    - Trae: `membership_name`, `color`.
+- **Left Join** con `Bronze_memberships_activityTypes` sobre `membershipID` Y `activityID`:
+    - Trae: `amount` (Entitlement previsto) y `period` (Ej: 'monthly', 'weekly').
+    - *Nota*: Esto permite comparar cuántas sesiones *debería* tener el usuario vs cuántas ha consumido.
 
-3. **Window Function** — Saldo por Usuario/Actividad:
-   ```
-   current_balance = sum(value) over (partitionBy: [userID, activityID], orderBy: transactionID ASC)
-   ```
+#### 3. Cálculo de Saldo en Tiempo Real (Windowing)
+Para saber cuántos créditos le quedan a un usuario en un momento dado:
+```javascript
+// Window: partitionBy(userID, activityID), orderBy(transactionID ASC)
+current_balance = sum(value) over (
+    partitionBy: [userID, activityID], 
+    orderBy: transactionID ASC
+)
+```
 
-4. **Sink** → `Silver_user_balances`
+#### 4. Slicing por Periodo (Lógica de Negocio)
+Dado que las membresías tienen periodicidad (Ej: 10 sesiones al mes), el DataFlow debe:
+- Generar un `period_id` basado en `transaction_createdAt` (Ej: '2024-03').
+- Agrupar consumos por ese `period_id` para validar si el usuario excedió su límite de membresía.
+
+**Sink** → `Silver_user_balances` (Ubicado en el ADLS Gen2 como Parquet).
 
 ---
 
